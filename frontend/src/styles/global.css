@@ -1,0 +1,47 @@
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', Arial, sans-serif;
+  background: #f0f2f5;
+}
+
+a {
+  text-decoration: none;
+}
+
+.dg-page-header {
+  margin-bottom: 16px;
+}
+
+.dg-card-title-extra {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: rgba(0, 0, 0, 0.45);
+  font-weight: normal;
+  font-size: 13px;
+}
+
+.dg-stat-trend-up {
+  color: #f5222d;
+}
+
+.dg-stat-trend-down {
+  color: #52c41a;
+}
+
+.dg-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 220px;
+  border-radius: 8px;
+  border: 1px dashed #d9d9d9;
+  background: #fafafa;
+  color: rgba(0, 0, 0, 0.45);
+}
