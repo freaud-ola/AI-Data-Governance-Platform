@@ -1,0 +1,197 @@
+name: ai-data-governance
+
+# ----------------------------------------------------------------------------
+# AI Data Governance Platform · 一键编排
+#
+# 说明：
+#   - postgres / redis 为缓存与任务队列基线；USE_MOCK=false 时后端读写 PostgreSQL。
+#   - frontend 走 Nginx 静态托管，并将 /api 反代到 backend 服务，无需配置 CORS。
+#
+# 用法：
+#   docker compose up -d            # 一键启动全部服务
+#   docker compose logs -f backend  # 查看后端日志
+#   docker compose down             # 停止
+#   docker compose down -v          # 停止并清理数据卷（危险）
+#
+# 可选数据源（与本业务对齐：Hive 集群 + 数据平台 MySQL）：
+#   在根目录 .env 设置 COMPOSE_PROFILES=datasources（见 .env.example），再 up：
+#     MySQL  宿主机端口 MYSQL_PLATFORM_PORT（默认 3307），库用于导入生产 DDL；
+#     Hive   拆分为 metastore（Thrift 9083）+ hiveserver2（JDBC 10000），与官方镜像用法一致；
+#       若曾被「Connection refused」：多数是 HS2 未起来，请先 docker compose logs hive-metastore / hive-dev。
+#       从单容器旧栈切换时请 profiles down 后删掉 hive 相关 volume 再 up（见 hive-metastore 服务注释）。
+#     Hive 排错：不要在容器里只运行 `hive`（Beeline 未连接会报 No current connection）。
+#       宿主执行：./scripts/hive-beeline.sh 或
+#       docker exec -it adg-hive-dev beeline -u 'jdbc:hive2://127.0.0.1:10000/default'
+# ----------------------------------------------------------------------------
+
+services:
+  postgres:
+    image: ${IMAGE_REGISTRY:-docker.io/library}/postgres:15-alpine
+    container_name: adg-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-adg}
+      POSTGRES_USER: ${POSTGRES_USER:-adg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-adg_dev_pwd}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-adg} -d $${POSTGRES_DB:-adg}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: ${IMAGE_REGISTRY:-docker.io/library}/redis:7-alpine
+    container_name: adg-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        IMAGE_REGISTRY: ${IMAGE_REGISTRY:-docker.io/library}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}
+    container_name: adg-backend
+    restart: unless-stopped
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      APP_DEBUG: ${APP_DEBUG:-true}
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8000
+      CORS_ORIGINS: "http://localhost:5173,http://127.0.0.1:5173,http://localhost,http://127.0.0.1"
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-default}
+      USE_MOCK: "false"
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-adg}:${POSTGRES_PASSWORD:-adg_dev_pwd}@postgres:5432/${POSTGRES_DB:-adg}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+  # ---------- profile: datasources（Hive + 数据平台 MySQL） ----------
+  mysql-platform:
+    profiles: ["datasources"]
+    image: ${IMAGE_REGISTRY:-docker.io/library}/mysql:8.4
+    container_name: adg-mysql-platform
+    hostname: mysql-platform
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_PLATFORM_ROOT_PASSWORD:-adg_mysql_root}
+      MYSQL_DATABASE: ${MYSQL_PLATFORM_DATABASE:-adg_platform}
+      MYSQL_USER: ${MYSQL_PLATFORM_USER:-adg_app}
+      MYSQL_PASSWORD: ${MYSQL_PLATFORM_PASSWORD:-adg_mysql_pwd}
+    ports:
+      - "${MYSQL_PLATFORM_PORT:-3307}:3306"
+    volumes:
+      - mysql_platform_data:/var/lib/mysql
+      - ./docker/mysql-platform/init:/docker-entrypoint-initdb.d:ro
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # 官方 standalone-metastore 镜像（Derby）；不要用 hive:4.0.0 + SERVICE_NAME=metastore，易失败。
+  # Docker 命名卷默认 root 属主，若仍以镜像内 hive 用户启动会因无权写 warehouse 直接退出；
+  # 开发环境下两台 Hive 容器均以 root 运行并挂载同一 warehouse。
+  hive-metastore:
+    profiles: ["datasources"]
+    image: ${HIVE_METASTORE_IMAGE:-apache/hive:standalone-metastore-4.2.0}
+    container_name: adg-hive-metastore
+    hostname: hive-metastore
+    user: "0:0"
+    restart: unless-stopped
+    environment:
+      HOME: /tmp
+    ports:
+      - "${HIVE_METASTORE_PORT:-9083}:9083"
+    volumes:
+      - hive_dev_warehouse:/opt/hive/data/warehouse
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/9083 && exec 3<&-' || exit 1",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 25
+      start_period: 180s
+
+  hive-dev:
+    profiles: ["datasources"]
+    image: ${HIVE_HS2_IMAGE:-apache/hive:4.2.0}
+    container_name: adg-hive-dev
+    hostname: hive-dev
+    user: "0:0"
+    restart: unless-stopped
+    depends_on:
+      hive-metastore:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: hiveserver2
+      IS_RESUME: "true"
+      HOME: /tmp
+      SERVICE_OPTS: "-Dhive.metastore.uris=thrift://hive-metastore:9083"
+    ports:
+      - "${HIVE_DEV_PORT:-10000}:10000"
+      - "${HIVE_DEV_WEBUI_PORT:-10002}:10002"
+    volumes:
+      - hive_dev_warehouse:/opt/hive/data/warehouse
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import socket;s=socket.socket();s.settimeout(3);s.connect(('127.0.0.1',10000));s.close()",
+        ]
+      interval: 20s
+      timeout: 6s
+      retries: 20
+      start_period: 240s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        IMAGE_REGISTRY: ${IMAGE_REGISTRY:-docker.io/library}
+    container_name: adg-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+
+volumes:
+  postgres_data:
+  redis_data:
+  mysql_platform_data:
+  hive_dev_warehouse:
